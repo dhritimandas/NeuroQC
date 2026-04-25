@@ -120,6 +120,7 @@ tqdm, openai (and on Linux, bitsandbytes for 4-bit quantization).
 | --------------------- | ------------------------ | ----------------------------------------------- |
 | **FreeSurfer 8.1.0+** | Phase 03 SynthSeg        | `bash scripts/install_freesurfer_macos.sh` (or `_linux.sh`); requires a free license at <https://surfer.nmr.mgh.harvard.edu/registration.html> |
 | **AWS CLI**           | Phase 09b S3 acquisition | `brew install awscli` (macOS) / `pip install awscli` |
+| **DataLad** + git-annex | Canonical orchestration via `Makefile` and `scripts/run_*.sh` (per-phase `datalad save`, `datalad run` provenance). Optional if you invoke phase scripts directly. | `brew install datalad git-annex` (macOS) / `pip install datalad && conda install -c conda-forge git-annex` (Linux) |
 | **NVIDIA GPU + CUDA** | Phase 08a/08b/09 (VLM inference + fine-tuning) | Set `CUDA_VISIBLE_DEVICES`; bf16 + bitsandbytes 4-bit not bit-deterministic across hardware |
 | **OpenAI API key**    | Phase 08b/10 GPT-4o head | `export OPENAI_API_KEY=...` |
 
@@ -259,15 +260,48 @@ Common flags shared across phases:
 
 ## Reproducibility
 
-* Every phase script writes a manifest with seed + git hash + library
-  versions where applicable. Phase 09 produces a `finetune_run_info_*.json`
-  with full hyperparameters + bucket distributions.
-* `scripts/bundle_results.py` packages results CSVs + figures + provenance
-  JSONs into a tar.gz with per-file SHA-256 manifest, suitable for
-  Zenodo-style reproducibility deposits or collaborator handoffs.
-* The full test suite runs on CPU in ~25 seconds; heavy GPU paths are
-  mocked. Adapter classes for the 5 VLMs are testable via the module-level
-  `_ADAPTERS` registry.
+NeuroQC treats reproducibility as a first-class engineering concern. The
+recipe has five layers:
+
+**1. Pinned dependency versions.** `pyproject.toml` declares minor-version
+floors for the entire scientific stack (numpy 2.x, torch ≥ 2.4,
+transformers ≥ 4.45, monai ≥ 1.4, …). bf16 + bitsandbytes 4-bit
+quantization is best-effort bit-deterministic across hardware and is noted
+as such in the dependency block.
+
+**2. Seed pinning + per-phase provenance manifests.** Every phase script
+takes a `--seed` flag (default 0) that pins Python / NumPy / Torch RNGs,
+then records the seed alongside the input git hash and the resolved
+library versions in the output CSV / JSON. Phase 09 (LoRA fine-tune)
+emits a `finetune_run_info_seed_*.json` with full hyperparameters,
+bucket distributions, and resume points. Phase 10 (ABIDE zero-shot)
+emits an `abide_zeroshot_summary_{model}_seed_*.json` with bootstrap
+seed, n_bootstrap, threshold-in-sample disclosure, and per-site /
+per-rater coverage.
+
+**3. DataLad-versioned data + derivatives** (used by the canonical
+orchestration in `Makefile` and `scripts/run_*.sh`). Each phase target
+wraps execution with `datalad run -i <inputs> -o <outputs> --` so the
+derived files (`data/derivatives/synthseg/`, `results/tables/*.csv`,
+`figures/*.png`) carry git-annex-tracked provenance: the exact input
+hashes, the command that produced them, and the env. After each phase
+the runner calls `datalad save -m "Phase N complete"`, producing one
+versioned commit per phase. **DataLad is optional for users who invoke
+the phase scripts directly** — the scripts are pure Python and run
+without DataLad — but the canonical re-run uses it.
+
+**4. Reproducibility archive.** `scripts/bundle_results.py` packages all
+results CSVs + figures + provenance JSONs into a `bundles/<tag>.tar.gz`
+with a per-file SHA-256 manifest, suitable for Zenodo-style deposits or
+collaborator handoffs without shipping the raw data.
+
+**5. Behavior-locked test suite.** `pytest -q` runs the full 131-test
+suite on CPU in ~25 seconds. Heavy GPU paths (VLM inference, LoRA
+fine-tuning) are mocked via the module-level `_ADAPTERS` registry — real
+model weights are never loaded. Bootstrap-CI tests assert byte-identical
+output for the same seed; consensus-variant tests assert the documented
+tie-breaking. The suite functions as a behavioral lock against silent
+metric drift.
 
 ## Data not included
 
