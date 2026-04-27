@@ -69,6 +69,7 @@ def _write_fastmri_h5(
     field_strength: float | None = 3.0,
     fov_mm: tuple[float, float, float] = (220.0, 220.0, 5.0),
     include_ismrmrd_header: bool = True,
+    rss_scale: float = 1.0,
 ) -> Path:
     """Write a minimal FastMRI-like .h5 file.
 
@@ -84,12 +85,16 @@ def _write_fastmri_h5(
         include_ismrmrd_header: If True, writes an ``ismrmrd_header``
             dataset with the reconSpace fields populated. Set False to
             test the fallback-voxel-size code path.
+        rss_scale: Multiplier applied to the synthetic RSS magnitudes
+            (default 1.0 → max ≈ 600). Use a small value (e.g. 1e-6) to
+            simulate the real FastMRI normalised-magnitude regime that
+            triggers the ``--rescale-intensity`` code path.
 
     Returns:
         The written path.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    rss = (torch.rand(*shape) * 500.0 + 100.0).float().numpy()
+    rss = ((torch.rand(*shape) * 500.0 + 100.0) * rss_scale).float().numpy()
     _, height, width = shape
     fov_x, fov_y, fov_z = fov_mm
     with h5py.File(path, "w") as handle:
@@ -199,6 +204,101 @@ def test_parse_voxel_sizes_falls_back_when_header_missing(
     )
     vy, vx, vz = extract_mod.parse_voxel_sizes(h5_path)
     assert (vy, vx, vz) == extract_mod.DEFAULT_VOXEL_MM
+
+
+def test_rescale_intensity_lifts_low_magnitudes(
+    extract_mod: types.ModuleType, tmp_path: Path
+) -> None:
+    """FastMRI RSS magnitudes (~10^-3) must be rescaled to T1-typical (>100)
+    so Phase 1 MIN_MAX_INTENSITY=100 does not reject the volume.
+    """
+    h5_path = _write_fastmri_h5(
+        tmp_path / "low_mag.h5",
+        acquisition="AXT1",
+        shape=(4, 8, 8),
+        rss_scale=1.0e-6,  # max ≈ 6e-4, mimics real FastMRI RSS regime
+    )
+    output_path = tmp_path / "rescaled.nii.gz"
+
+    record = extract_mod.extract_one(
+        h5_path,
+        output_path,
+        frozenset({"AXT1"}),
+        force=False,
+        dry_run=False,
+        rescale_intensity=True,
+    )
+
+    assert record is not None
+    img = nib.load(str(output_path))
+    arr = img.get_fdata()
+    assert float(arr.max()) > 100.0, (
+        f"Rescale failed: max={arr.max():.3e}, expected > 100"
+    )
+    # Sanity: rescaled max should be ~RESCALE_FACTOR × pre_max ≈ 600.
+    assert float(arr.max()) < 1.0e4, "Rescale overshot — check factor"
+
+
+def test_no_rescale_intensity_leaves_low_magnitudes_unchanged(
+    extract_mod: types.ModuleType, tmp_path: Path
+) -> None:
+    """Passing --no-rescale-intensity (i.e. rescale_intensity=False) must
+    preserve the raw RSS magnitudes; the output's max stays in the input
+    regime (well below MIN_MAX_INTENSITY).
+    """
+    h5_path = _write_fastmri_h5(
+        tmp_path / "low_mag_keep.h5",
+        acquisition="AXT1",
+        shape=(4, 8, 8),
+        rss_scale=1.0e-6,
+    )
+    output_path = tmp_path / "raw.nii.gz"
+
+    record = extract_mod.extract_one(
+        h5_path,
+        output_path,
+        frozenset({"AXT1"}),
+        force=False,
+        dry_run=False,
+        rescale_intensity=False,
+    )
+
+    assert record is not None
+    img = nib.load(str(output_path))
+    arr = img.get_fdata()
+    assert float(arr.max()) < 1.0, (
+        f"Expected raw low-mag passthrough, got max={arr.max():.3e}"
+    )
+
+
+def test_rescale_intensity_skips_when_max_already_in_range(
+    extract_mod: types.ModuleType, tmp_path: Path
+) -> None:
+    """Already-typical-intensity inputs (max >= RESCALE_THRESHOLD) must
+    pass through unchanged even with rescale_intensity=True.
+    """
+    h5_path = _write_fastmri_h5(
+        tmp_path / "typical.h5",
+        acquisition="AXT1",
+        shape=(4, 8, 8),
+        # default rss_scale=1.0 → max ≈ 600 (already > RESCALE_THRESHOLD).
+    )
+    output_path = tmp_path / "typical.nii.gz"
+
+    record = extract_mod.extract_one(
+        h5_path,
+        output_path,
+        frozenset({"AXT1"}),
+        force=False,
+        dry_run=False,
+        rescale_intensity=True,
+    )
+
+    assert record is not None
+    img = nib.load(str(output_path))
+    arr = img.get_fdata()
+    # Should be in the original ~100-600 range, not multiplied by 1e6.
+    assert 100.0 < float(arr.max()) < 1.0e4
 
 
 def test_extract_all_filters_by_acquisition_and_writes_manifest(

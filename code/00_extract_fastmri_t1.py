@@ -30,12 +30,18 @@ Resume semantics:
       skipped entirely (not present in the manifest).
 
 Inputs:
-    --input-dir      Directory containing ``.h5`` files (searched recursively).
-    --output-dir     Directory for extracted ``.nii.gz`` volumes.
-    --manifest-csv   CSV listing every kept volume.
-    --acquisitions   Comma-separated acquisition allow-list.
-    --dry-run        Scan + report only; no NIfTI or manifest written.
-    --force          Re-extract volumes even when the output NIfTI exists.
+    --input-dir          Directory containing ``.h5`` files (searched recursively).
+    --output-dir         Directory for extracted ``.nii.gz`` volumes.
+    --manifest-csv       CSV listing every kept volume.
+    --acquisitions       Comma-separated acquisition allow-list.
+    --dry-run            Scan + report only; no NIfTI or manifest written.
+    --force              Re-extract volumes even when the output NIfTI exists.
+    --rescale-intensity  Multiply by ``RESCALE_FACTOR`` (1e6) when the volume's
+                         max value is below ``RESCALE_THRESHOLD`` (1.0). FastMRI
+                         RSS magnitudes are normalised to ``~10^-3``, which fails
+                         downstream Phase-1 ``MIN_MAX_INTENSITY`` (=100). Default
+                         on. SynthSeg is contrast-invariant (Billot 2023, §3),
+                         so the rescaling is safe for the segmentation pipeline.
 
 Outputs:
     <output-dir>/<file_id>.nii.gz  Per-volume NIfTI (one per passing file).
@@ -77,6 +83,13 @@ ACQUISITION_ATTR: str = "acquisition"
 FIELD_STRENGTH_ATTR: str = "systemFieldStrength_T"
 
 DEFAULT_ACQUISITIONS: tuple[str, ...] = ("AXT1", "AXT1PRE", "AXT1POST")
+
+# FastMRI RSS magnitudes are stored as float32 normalised to ~10^-4 -- 10^-3.
+# Phase 01 enforces MIN_MAX_INTENSITY=100; without rescaling every FastMRI scan
+# fails QC. Rescaling is gated on `volume.max() < RESCALE_THRESHOLD` so that
+# already-rescaled or natively-large inputs pass through unchanged.
+RESCALE_FACTOR: float = 1.0e6
+RESCALE_THRESHOLD: float = 1.0
 
 # Fallback voxel sizes when ismrmrd_header parse fails. These are the
 # nominal AXT1 brain values published in Knoll et al. (2020), "fastMRI:
@@ -323,6 +336,7 @@ def extract_one(
     *,
     force: bool,
     dry_run: bool,
+    rescale_intensity: bool = True,
 ) -> ExtractionRecord | None:
     """Extract one FastMRI file to NIfTI, or skip it.
 
@@ -335,6 +349,13 @@ def extract_one(
     SynthSeg's inference pipeline resamples to its target_res internally
     when the input lies outside ``[target - 0.05, target + 0.05]``, which
     for FastMRI AXT1 ``(0.6875, 0.6875, 5.0)`` is true for every axis.
+
+    Args:
+        rescale_intensity: When True (default), multiply the RSS magnitude
+            by ``RESCALE_FACTOR`` if its max is below ``RESCALE_THRESHOLD``.
+            FastMRI RSS values live around 1e-3, which falls below Phase 1's
+            ``MIN_MAX_INTENSITY=100``. Rescaling preserves SynthSeg behaviour
+            (the model is contrast-invariant) while letting curation pass.
     """
     acquisition, (n_slices, height, width), field_strength = peek_metadata(h5_path)
 
@@ -367,6 +388,19 @@ def extract_one(
         return record
 
     volume = load_rss_volume(h5_path)  # (H, W, D) torch float32
+
+    if rescale_intensity:
+        pre_max = float(volume.max().item())
+        if pre_max < RESCALE_THRESHOLD:
+            volume = volume * RESCALE_FACTOR
+            logger.info(
+                "Rescaled %s: max %.3e -> %.1f (factor %.0e)",
+                h5_path.name,
+                pre_max,
+                float(volume.max().item()),
+                RESCALE_FACTOR,
+            )
+
     affine = build_affine(voxel_mm)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -398,6 +432,7 @@ def extract_all(
     allowed_acquisitions: frozenset[str] = frozenset(DEFAULT_ACQUISITIONS),
     dry_run: bool = False,
     force: bool = False,
+    rescale_intensity: bool = True,
 ) -> list[ExtractionRecord]:
     """Extract every matching FastMRI ``.h5`` under input_dir to NIfTI.
 
@@ -408,6 +443,7 @@ def extract_all(
         allowed_acquisitions: Exact-match set against ``attrs["acquisition"]``.
         dry_run: If True, no NIfTI or manifest is written.
         force: If True, re-extract even when the output exists.
+        rescale_intensity: Forwarded to :func:`extract_one`. Default True.
 
     Returns:
         List of records for every file that passed the acquisition filter.
@@ -440,6 +476,7 @@ def extract_all(
                 allowed_acquisitions,
                 force=force,
                 dry_run=dry_run,
+                rescale_intensity=rescale_intensity,
             )
         except Exception as exc:
             logger.exception("Failed to extract %s: %s", h5_path, exc)
@@ -533,6 +570,16 @@ def main(
     force: bool = typer.Option(
         False, "--force", help="Re-extract volumes even when outputs exist."
     ),
+    rescale_intensity: bool = typer.Option(
+        True,
+        "--rescale-intensity/--no-rescale-intensity",
+        help=(
+            "Multiply RSS magnitudes by RESCALE_FACTOR (1e6) when max < "
+            "RESCALE_THRESHOLD (1.0). FastMRI normalised magnitudes "
+            "(~10^-3) otherwise fail Phase 1 MIN_MAX_INTENSITY=100. "
+            "SynthSeg is contrast-invariant so this is safe."
+        ),
+    ),
 ) -> None:
     """Extract T1-weighted magnitude NIfTI volumes from FastMRI HDF5 files."""
     logging.basicConfig(
@@ -549,6 +596,7 @@ def main(
         allowed_acquisitions=allow_list,
         dry_run=dry_run,
         force=force,
+        rescale_intensity=rescale_intensity,
     )
     _print_summary(records, total_scanned, Console())
 
