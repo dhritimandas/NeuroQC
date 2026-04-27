@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 #
 # install_freesurfer_linux.sh — fully automated FreeSurfer install on Linux
-# (Ubuntu 22 / CentOS 7). Defaults to version 8.2.0; override with FS_VERSION.
+# (Ubuntu 22 / CentOS 7). Defaults to version 7.4.1 (last release with a
+# Linux tarball at the canonical surfer.nmr.mgh.harvard.edu mirror; FS 8.x
+# ships as a Debian .deb for Ubuntu, see docs/runpod_setup.md for the apt
+# install path). Override via FS_VERSION.
 # Intended for DANDI Hub (if FS is not already present) and Jarvis Labs.
 # Idempotent: skips already-downloaded/extracted artefacts.
 #
@@ -11,14 +14,14 @@
 #   piping through env vars). Exactly one must be set.
 #
 # Environment overrides:
-#   FS_VERSION      — default 8.2.0 (override for other releases)
+#   FS_VERSION      — default 7.4.1 (override for other releases)
 #   FS_INSTALL_DIR  — default $HOME/freesurfer (version dir appended)
 #   FS_DISTRO       — "ubuntu22" (default) or "centos7"
 #   FS_TARBALL_URL  — override the download URL if defaults 404
 
 set -euo pipefail
 
-FS_VERSION="${FS_VERSION:-8.2.0}"
+FS_VERSION="${FS_VERSION:-7.4.1}"
 FS_INSTALL_DIR="${FS_INSTALL_DIR:-$HOME/freesurfer}"
 FS_DISTRO="${FS_DISTRO:-ubuntu22}"
 
@@ -48,7 +51,7 @@ else
     if [ -f "${FS_TARBALL_PATH}" ]; then
         log "Tarball already downloaded at ${FS_TARBALL_PATH}"
     else
-        log "Downloading ${FS_TARBALL_URL} (~5 GB) to ${FS_TARBALL_PATH}"
+        log "Downloading ${FS_TARBALL_URL} (~9 GB) to ${FS_TARBALL_PATH}"
         /usr/bin/curl -L -C - --fail --output "${FS_TARBALL_PATH}" "${FS_TARBALL_URL}"
     fi
 
@@ -78,8 +81,13 @@ fi
 
 # ── setup + verify ──
 export FREESURFER_HOME
+# FreeSurfer's setup references unbound vars (e.g. SUBJECTS_DIR) and runs
+# internal tests with non-zero returns; toggle errexit + nounset around
+# the source so it doesn't trip our `set -euo pipefail`.
+set +eu
 # shellcheck disable=SC1091
 source "${FREESURFER_HOME}/SetUpFreeSurfer.sh" > /dev/null
+set -eu
 
 if command -v mri_synthseg >/dev/null 2>&1; then
     log "OK: mri_synthseg available at $(command -v mri_synthseg)"
