@@ -118,7 +118,7 @@ tqdm, openai (and on Linux, bitsandbytes for 4-bit quantization).
 
 | Tool                  | Required for             | Install                                         |
 | --------------------- | ------------------------ | ----------------------------------------------- |
-| **FreeSurfer 8.1.0+** | Phase 03 SynthSeg        | `bash scripts/install_freesurfer_macos.sh` (or `_linux.sh`); requires a free license at <https://surfer.nmr.mgh.harvard.edu/registration.html> |
+| **FreeSurfer**        | Phase 03 SynthSeg        | macOS: 8.1.0+ via `bash scripts/install_freesurfer_macos.sh`. Linux: 8.2.0 via apt `.deb` (Ubuntu 22 — preferred) or 7.4.1 tarball via `bash scripts/install_freesurfer_linux.sh`. All paths require a free license at <https://surfer.nmr.mgh.harvard.edu/registration.html>. Note: FreeSurfer's bundled SynthSeg is CPU-only on modern hosts (FS team has deprecated GPU support); for GPU runs, use the standalone `BBillot/SynthSeg` clone — see `docs/runpod_setup.md`. |
 | **AWS CLI**           | Phase 09b S3 acquisition | `brew install awscli` (macOS) / `pip install awscli` |
 | **DataLad** + git-annex | Canonical orchestration via `Makefile` and `scripts/run_*.sh` (per-phase `datalad save`, `datalad run` provenance). Optional if you invoke phase scripts directly. | `brew install datalad git-annex` (macOS) / `pip install datalad && conda install -c conda-forge git-annex` (Linux) |
 | **NVIDIA GPU + CUDA** | Phase 08a/08b/09 (VLM inference + fine-tuning) | Set `CUDA_VISIBLE_DEVICES`; bf16 + bitsandbytes 4-bit not bit-deterministic across hardware |
@@ -134,6 +134,29 @@ pytest -q                        # 131 tests; ~25 sec
 If `pytest` is green, the codebase is in working order. Heavy GPU paths
 are mocked in tests (real model weights are never loaded), so this works
 on CPU-only laptops.
+
+## Cloud GPU deployment
+
+The full pipeline (Phases 03 SynthSeg, 08 VLM eval, 09 LoRA fine-tune)
+benefits from a GPU. We run cloud bootstraps on two platforms; setup
+guides for each are kept alongside this repo (gitignored — request from
+the maintainer for now):
+
+- `docs/runpod_setup.md` — A100 SXM 80 GB on RunPod, the production
+  target. `scripts/runpod_setup.sh` is a one-shot bootstrap that clones
+  the standalone `BBillot/SynthSeg` repo, applies portability patches
+  (NumPy-2 / Keras-3), installs cu118 PyTorch + tensorflow[and-cuda] +
+  tf-keras, sources FreeSurfer 8.2.0 (apt `.deb`), and writes an env
+  sentinel that re-establishes the full state on any new shell.
+  `scripts/runpod_stage_data.sh` then copies hot data to local NVMe
+  (avoiding RunPod's MooseFS-backed `/workspace`, which is ~10× slower
+  for SynthSeg's metadata-heavy I/O).
+- `docs/dandi_hub_setup.md` — DANDI Hub T4 GPU image, free for
+  academic use. Different friction (idle culler + EFS), same end-state.
+
+The smoke run (`scripts/run_prototype.sh`) is platform-agnostic — set
+`SYNTHSEG_MODE=python` for GPU, `SYNTHSEG_MODE=freesurfer` for CPU
+fallback. Default is `python`. See env vars in the script header.
 
 ## Running the pipeline
 
@@ -317,6 +340,23 @@ To reproduce the data side: run `code/00_extract_fastmri_t1.py` on FastMRI
 HDF5 inputs (subscription required) and `code/09b_acquire_abide.py` on the
 public ABIDE-I S3 mirror. Both scripts are anonymous-read; no credentials
 needed for ABIDE.
+
+## Troubleshooting common issues
+
+Operational issues we've hit and their fixes. Pipeline-specific issues
+are in the per-phase script docstrings.
+
+| Symptom | Fix |
+| --- | --- |
+| Phase 01 reports `0 passed` for FastMRI | The H5→NIfTI extractor writes RSS magnitudes verbatim (max ≈ 10⁻³), which fails `MIN_MAX_INTENSITY=100`. Re-extract with `python code/00_extract_fastmri_t1.py --rescale-intensity --input-dir … --output-dir …` (default ON). For already-extracted NIfTIs, use the in-place rescale snippet in `scripts/runpod_stage_data.sh`. |
+| Phase 03 SynthSeg `--mode python` fails with `model path does not exist` | Standalone SynthSeg doesn't bundle weights. Symlink them from FreeSurfer: `ln -s $FREESURFER_HOME/models <SynthSeg-clone>/models`. `scripts/runpod_setup.sh:Phase 9` automates this. |
+| `RuntimeError: NVIDIA driver too old` (PyTorch) | The default `pip install torch` pulls cu121 wheels (need driver 530+). Reinstall with the cu118 index (works on driver 525+): `pip install torch torchvision --upgrade --index-url https://download.pytorch.org/whl/cu118`. |
+| Phase 03 wall-clock unexpectedly multi-hour | Confirm `--mode python` (not `--mode freesurfer`) — FreeSurfer's bundled SynthSeg is CPU-only on modern hosts. Also verify TF sees the GPU: `python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"`. |
+| RunPod SSH `Permission denied (publickey)` | Add your SSH pubkey via RunPod **Settings → SSH Keys** (account-level — injected into every new pod). Or use the Web Terminal once: `cat <pubkey> >> ~/.ssh/authorized_keys`. |
+| TensorFlow allocates all GPU memory at start | `export TF_FORCE_GPU_ALLOW_GROWTH=true` — included in `scripts/runpod_setup.sh`'s env sentinel. |
+| FreeSurfer setup script trips `set -euo pipefail` | `SetUpFreeSurfer.sh` uses unbound vars and runs internal tests with non-zero returns. Wrap with `set +eu; source $FREESURFER_HOME/SetUpFreeSurfer.sh; set -eu`. |
+| Pipeline I/O slow on cloud GPU instance | If working dir is a network filesystem (RunPod `/workspace`, DANDI Hub `/home/<user>`), stage hot data to a local-disk path. Per-scan SynthSeg I/O can be ~10× faster on local NVMe than network FS. |
+| `pytest` fails with `command 'git-annex' not found` | DataLad-managed repos require `git-annex` to commit. Install via Homebrew (macOS): `brew install git-annex`. Linux: `conda install -c conda-forge git-annex` or `apt install git-annex`. |
 
 ## Citation
 
