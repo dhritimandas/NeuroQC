@@ -3,8 +3,8 @@
 # install_freesurfer_linux.sh — fully automated FreeSurfer install on Linux
 # (Ubuntu 22 / CentOS 7). Defaults to version 7.4.1 (last release with a
 # Linux tarball at the canonical surfer.nmr.mgh.harvard.edu mirror; FS 8.x
-# ships as a Debian .deb for Ubuntu, see docs/runpod_setup.md for the apt
-# install path). Override via FS_VERSION.
+# ships as a Debian .deb for Ubuntu, see docs/gpu_server_setup.md for the
+# apt install path). Override via FS_VERSION.
 # Intended for DANDI Hub (if FS is not already present) and Jarvis Labs.
 # Idempotent: skips already-downloaded/extracted artefacts.
 #

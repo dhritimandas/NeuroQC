@@ -1,31 +1,40 @@
 #!/usr/bin/env bash
 #
-# scripts/runpod_setup.sh — one-shot pod-side bootstrap for RunPod GPU pods.
+# scripts/gpu_server_setup.sh — one-shot bootstrap for any A100 / Hopper-class
+# cloud GPU server (RunPod, Jarvis, Lambda, Coreweave, vast.ai, ...). The
+# script is provider-agnostic; the only host-specific assumption is the
+# /workspace + /root layout described below, which is the de-facto standard
+# on these hosts.
 #
 # What this script delivers (idempotent end-to-end):
 #   1. NeuroQC + nobrainer (feat/qc-update) cloned and editable-installed
-#   2. Python 3.12 venv at /root/neuroqc-venv (fast local NVMe, not MooseFS)
-#   3. Project deps + GPU PyTorch (cu118) + TensorFlow GPU + tf-keras shim
+#   2. Python 3.12 venv on local NVMe (default /root/neuroqc-venv, not the
+#      quota'd network FS that backs /workspace on most cloud GPU hosts)
+#   3. Project deps + GPU PyTorch (cu118) + TensorFlow GPU + tf-keras shim,
+#      with a hardened Phase 6 (cu13 cleanup, cu12 force-reinstall, numpy<2)
 #   4. FreeSurfer 8.2.0 via apt .deb (Ubuntu 22) — fallback 7.4.1 tarball
-#   5. BBillot/SynthSeg standalone clone with NumPy-2 / Keras-3 sed patches
-#      + symlink to FS-bundled model weights
-#   6. HuggingFace cache pinned to /root/hf_cache (avoids MooseFS quota)
-#   7. Env sentinel /workspace/neuroqc_env.sh that primes a fresh shell with
+#   5. BBillot/SynthSeg standalone clone with NumPy-2 / Keras-3 / predict.py
+#      sed patches + symlink to FS-bundled model weights
+#   6. HuggingFace cache pinned to local NVMe (avoids /workspace quota)
+#   7. Env sentinel ${WORK_DIR}/neuroqc_env.sh that primes a fresh shell with
 #      everything (venv + FS + SynthSeg + GPU + TF + HF + DataLad opt-out)
+#   8. Conv3D smoke (Phase 12.5) that exercises cuDNN end-to-end in ~5 s,
+#      so any cu13/cuDNN ABI mismatch surfaces before the first real phase
 #
 # Why /root over /workspace for hot data:
-#   /workspace on RunPod is MooseFS network storage (~50-200 MB/s, ms latency)
-#   /root is the container's local NVMe overlay (~3-7 GB/s, µs latency)
-#   For SynthSeg's metadata-heavy I/O this is a 10× speedup.
+#   /workspace on most cloud GPU hosts is a quota'd network filesystem
+#   (e.g. MooseFS, EFS) at ~50-200 MB/s with ms-scale latency.
+#   /root is the container's local NVMe overlay at ~3-7 GB/s, µs latency.
+#   For SynthSeg's metadata-heavy I/O this is a ~10× speedup.
 #   Trade-off: /root is wiped when the pod is *Terminated* (not Stopped).
 #
 # Assumptions:
-#   * Pod base image: runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
-#     (or any Python 3.11+, CUDA 12.x, NVIDIA driver >= 525 image with root.)
+#   * Container image: any Python 3.11+, CUDA 12.x, NVIDIA driver >= 525,
+#     root access (e.g. runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04).
 #   * Container disk size >= 150 GB.
-#   * /workspace contains an extracted neuroqc_runpod.tar.gz with:
-#         /workspace/NeuroQC/             — full repo source
-#         /workspace/freesurfer_license.txt
+#   * ${WORK_DIR} (default /workspace) contains:
+#         ${WORK_DIR}/NeuroQC/             — full repo source
+#         ${WORK_DIR}/freesurfer_license.txt
 #   * Pod is on-demand (not spot) so we won't be reclaimed mid-install.
 #
 # Time: ~20-30 min total — most of it is FS install (8-13 GB) + nobrainer
@@ -54,7 +63,7 @@ FS_LICENSE_SRC="${FS_LICENSE_SRC:-${WORK_DIR}/freesurfer_license.txt}"
 # 530+.
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu118}"
 
-log() { printf '[runpod_setup %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+log() { printf '[gpu_server_setup %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 section() { printf '\n========================================\n%s\n========================================\n' "$*"; }
 
 # ── Phase 0: GPU + driver check ────────────────────────────────────────────
@@ -144,6 +153,27 @@ assert torch.cuda.is_available(), 'PyTorch cannot see CUDA — driver may be too
 section "Phase 6 — TensorFlow GPU + tf-keras"
 log "Installing tensorflow[and-cuda] and tf-keras (Keras-2 shim)"
 pip install 'tensorflow[and-cuda]' tf-keras --quiet
+
+# tensorflow[and-cuda]>=2.21 transitively pulls nvidia-*-cu13 wheels whose
+# cu13/lib lands FIRST in LD_LIBRARY_PATH (alphabetical) and serves a cuDNN
+# ABI that TF (built against CUDA 12.5.1) cannot initialise. Symptoms:
+# "No DNN in stream executor" / CUDNN_STATUS_INTERNAL_ERROR. Strip them and
+# force-reinstall the cu12 cuDNN (the uninstall removes shared .so files
+# that other cu12 packages still need).
+log "Removing cu13 NVIDIA wheels and force-reinstalling cu12 cuDNN"
+pip uninstall -y nvidia-cudnn-cu13 nvidia-cusparselt-cu13 nvidia-nccl-cu13 \
+    nvidia-nvshmem-cu13 2>/dev/null || true
+rm -rf "${VENV_DIR}/lib/python"*"/site-packages/nvidia/cu13" 2>/dev/null || true
+pip install --force-reinstall nvidia-cudnn-cu12 --quiet
+
+# SynthSeg's predict.py / get_flip_indices does `array_2d[i,j] = np.where(..)[0]`
+# which NumPy 2.x rejects ("setting an array element with a sequence" — the
+# implicit length-1-array → scalar coercion was removed in 2.0). SynthSeg's
+# upstream environment.yml pins numpy=1.24; we accept anything <2.0. TF 2.21
+# supports the full 1.x line.
+log "Pinning numpy<2.0 (SynthSeg incompatible with NumPy 2.x scalar rules)"
+pip install 'numpy<2.0' --quiet
+
 log "TF version + GPU check (in venv, before LD_LIBRARY_PATH patch)"
 python -c "
 import tensorflow as tf
@@ -253,6 +283,26 @@ find "${SYNTHSEG_DIR}/SynthSeg" "${SYNTHSEG_DIR}/ext" -name "*.py" -print0 2>/de
     fi
 done
 
+# Catch the dotted-import variant — `import keras.layers as KL` mixes a
+# Keras-3 module into code that expects tf-keras' Keras-2 Model class,
+# triggering "AttributeError: 'KerasTensor' object has no attribute 'node'"
+# at graph build time. The two preceding loops only catch `^import keras$`
+# and `^from keras\b`, so this dotted form slips through.
+find "${SYNTHSEG_DIR}/SynthSeg" "${SYNTHSEG_DIR}/ext" -name "*.py" -print0 2>/dev/null | xargs -0 sed -i \
+    -e 's|^import keras\.\([a-zA-Z0-9_]*\)|import tf_keras.\1|' \
+    -e 's|^from keras\.\([a-zA-Z0-9_]*\)|from tf_keras.\1|' 2>/dev/null || true
+
+# SynthSeg/predict.py:579 does `lr_indices[i, j] = np.where(labels == lab)[0]`
+# which assigns a length-1 array into a scalar slot. Worked under NumPy 1.x's
+# implicit coercion; NumPy 2.x raises ValueError. The numpy<2.0 pin in Phase 6
+# is the primary fix; this sed is defence-in-depth (safe under both lines and
+# survives an accidental numpy upgrade).
+log "Patching SynthSeg/predict.py:579 explicit scalar coercion"
+if [ -f "${SYNTHSEG_DIR}/SynthSeg/predict.py" ]; then
+    sed -i 's|lr_indices\[i, j\] = np\.where(labels_segmentation == lab)\[0\]$|lr_indices[i, j] = np.where(labels_segmentation == lab)[0][0]|' \
+        "${SYNTHSEG_DIR}/SynthSeg/predict.py"
+fi
+
 log "Symlinking SynthSeg model weights from ${FS_HOME}/models"
 SS_MODELS="${SYNTHSEG_DIR}/models"
 if [ -d "${FS_HOME}/models" ] && [ ! -L "${SS_MODELS}" ]; then
@@ -322,10 +372,28 @@ log "TF GPU:          $(python -c 'import tensorflow as tf; print(tf.config.list
 log "SynthSeg CLI:    $(ls -la ${SYNTHSEG_DIR}/scripts/commands/SynthSeg_predict.py 2>&1 | head -1)"
 log "SynthSeg models: $(ls -la ${SYNTHSEG_DIR}/models 2>&1 | head -1)"
 
+# ── Phase 12.5: Conv3D smoke ───────────────────────────────────────────────
+# Phase 12's TF GPU check only verifies the device is *visible*; it doesn't
+# exercise cuDNN. A cu13 ABI mismatch shows up as a successful tf.config call
+# followed by CUDNN_STATUS_INTERNAL_ERROR the first time a real op runs. Doing
+# a 5-second Conv3D here turns "5+ minutes into Phase 03 before it crashes"
+# into "fails immediately with an actionable assert".
+section "Phase 12.5 — Conv3D smoke (catches cuDNN ABI issues fast)"
+python -c "
+import tensorflow as tf
+gpus = tf.config.list_physical_devices('GPU')
+assert gpus, 'TF cannot see GPU; check Phase 6 cu13 cleanup + Phase 7 LD_LIBRARY_PATH'
+x = tf.random.uniform((1, 16, 16, 16, 1))
+y = tf.keras.layers.Conv3D(8, 3, padding='same')(x)
+expected = [1, 16, 16, 16, 8]
+assert y.shape.as_list() == expected, f'Conv3D returned wrong shape: {y.shape}'
+print('Conv3D OK on', gpus[0].name)
+"
+
 cat <<EOF
 
 ──────────────────────────────────────────────────────────
-RunPod setup complete.
+GPU server setup complete.
 
 Next step (1-scan GPU detection test):
 
@@ -347,8 +415,15 @@ Next step (1-scan GPU detection test):
 If GPU works, stage data to /root and launch the smoke (~50-60 min on A100):
 
     bash ${NEUROQC_DIR}/scripts/runpod_stage_data.sh
-    cd ${NEUROQC_DIR}
-    source ${WORK_DIR}/neuroqc_env.sh
+
+    # Launch under tmux + auto-restart so SSH disconnects don't kill the run.
+    # The helper sources neuroqc_env.sh, retries up to 5x on transient failure,
+    # and prints final phase markers on completion.
+    tmux new-session -d -s smoke 'bash ${NEUROQC_DIR}/scripts/gpu_server_launch_smoke.sh'
+    tmux attach -t smoke   # detach with Ctrl-B D; reconnect any time
+
+  If you don't have tmux available and accept the SSH-drop risk, the legacy
+  nohup invocation still works:
     nohup bash -c '
         source ${WORK_DIR}/neuroqc_env.sh
         SYNTHSEG_MODE=python NUM_REFS_CALIB=15 NUM_REFS_SMOKE=15 \\
@@ -356,9 +431,9 @@ If GPU works, stage data to /root and launch the smoke (~50-60 min on A100):
         FASTMRI_INPUT_DIR=/root/data/fastmri/nifti \\
         ABIDE_INPUT_DIR=/root/data/abide \\
             bash scripts/run_prototype.sh
-    ' > /workspace/smoke.log 2>&1 &
-    echo \$! > /workspace/smoke.pid
+    ' > ${WORK_DIR}/smoke.log 2>&1 &
+    echo \$! > ${WORK_DIR}/smoke.pid
     disown
-    tail -f /workspace/smoke.log
+    tail -f ${WORK_DIR}/smoke.log
 ──────────────────────────────────────────────────────────
 EOF
