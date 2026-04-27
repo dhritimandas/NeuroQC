@@ -54,10 +54,10 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
 
 import typer
 from rich.console import Console
@@ -295,64 +295,181 @@ def run_freesurfer(
 # ──────────────────────────────────────────────
 
 
-def _load_synthseg_predict() -> Callable[..., Any]:
-    """Lazy import of SynthSeg.predict_synthseg.predict so this module stays importable without SynthSeg.
+def _locate_synthseg_cli() -> Path:
+    """Return the path to ``SynthSeg/scripts/commands/SynthSeg_predict.py``.
 
-    We target ``SynthSeg.predict_synthseg`` (not ``SynthSeg.predict``): the former is the
-    production entrypoint used by ``scripts/commands/SynthSeg_predict.py``, which auto-discovers
-    model weights and label files from the SynthSeg repo layout.
+    We shell out to the CLI script rather than calling
+    ``SynthSeg.predict_synthseg.predict()`` directly because the latter
+    requires 20+ positional args that change between SynthSeg versions
+    (``path_model_segmentation``, ``labels_segmentation``, ``robust``,
+    ``fast``, ``v1``, ``n_neutral_labels``, ``labels_denoiser``,
+    ``path_posteriors``, ``path_resampled``, ``path_model_parcellation``,
+    ``labels_parcellation``, ``path_model_qc``, ``labels_qc``,
+    ``cropping`` …). The CLI is the production entrypoint that constructs
+    those args from the repo's known model + label layout, and its
+    ``--i / --o / --qc / --vol / --parc / --fast`` flags are stable across
+    versions (in fact ``mri_synthseg`` also dispatches to this same CLI).
 
-    NOTE: Python mode requires a Python-3.6/3.8 env with TensorFlow 2.2 and Keras 2.3 — the pins
-    SynthSeg's ``setup.py`` enforces. It is not runnable from the neuroqc venv on Apple Silicon /
-    Python 3.12. Use ``--mode freesurfer`` locally; reserve Python mode for environments where
-    SynthSeg is importable (e.g. a conda py38 env on Jarvis).
+    Resolution priority:
+      1. ``$SYNTHSEG_HOME`` env var pointing at the cloned repo root.
+      2. Walk up from an importable ``SynthSeg`` package.
+      3. Standard install locations: ``$HOME/SynthSeg``, ``/opt/SynthSeg``.
     """
+    candidates: list[Path] = []
+    env_home = os.environ.get("SYNTHSEG_HOME")
+    if env_home:
+        candidates.append(Path(env_home) / "scripts" / "commands" / "SynthSeg_predict.py")
     try:
-        from SynthSeg.predict_synthseg import predict
-    except ImportError as exc:
-        raise typer.BadParameter(
-            "SynthSeg Python package not importable. Clone "
-            "github.com/BBillot/SynthSeg into a Python 3.8 env with TensorFlow 2.2, "
-            "or use --mode freesurfer (which calls FreeSurfer's bundled mri_synthseg)."
-        ) from exc
-    return predict
+        import SynthSeg  # type: ignore[import-not-found]
+        repo_root = Path(SynthSeg.__file__).resolve().parent.parent
+        candidates.append(repo_root / "scripts" / "commands" / "SynthSeg_predict.py")
+    except ImportError:
+        pass
+    for base in (Path.home() / "SynthSeg", Path("/opt/SynthSeg")):
+        candidates.append(base / "scripts" / "commands" / "SynthSeg_predict.py")
+    for cli in candidates:
+        if cli.is_file():
+            return cli
+    raise typer.BadParameter(
+        "Cannot locate SynthSeg's CLI (scripts/commands/SynthSeg_predict.py). "
+        "Either set $SYNTHSEG_HOME to the SynthSeg repo root, or clone "
+        "https://github.com/BBillot/SynthSeg.git to ~/SynthSeg, or use "
+        "--mode freesurfer (which calls FreeSurfer's bundled mri_synthseg)."
+    )
 
 
-def _chunks(items: list[ScanPlan], size: int) -> list[list[ScanPlan]]:
-    return [items[i : i + size] for i in range(0, len(items), size)]
+def _build_python_cmd(
+    cli_path: Path,
+    plan: ScanPlan,
+    *,
+    parc: bool,
+    fast: bool,
+) -> list[str]:
+    """Return the SynthSeg CLI argv for a single scan.
+
+    Same flag set as ``_build_freesurfer_cmd`` — both targets accept
+    identical arguments because ``mri_synthseg`` is a thin wrapper around
+    this same CLI.
+    """
+    cmd = [
+        sys.executable,
+        str(cli_path),
+        "--i", str(plan.input_path),
+        "--o", str(plan.seg_path),
+        "--qc", str(plan.qc_path),
+        "--vol", str(plan.vol_path),
+    ]
+    if parc:
+        cmd.append("--parc")
+    if fast:
+        cmd.append("--fast")
+    return cmd
 
 
 def run_python(
-    plans: list[ScanPlan], batch_size: int
+    plans: list[ScanPlan],
+    batch_size: int,
+    *,
+    parc: bool = True,
+    fast: bool = False,
 ) -> list[tuple[ScanPlan, str]]:
-    """Batched calls to SynthSeg.predict; one call per chunk of ``batch_size``."""
+    """Run SynthSeg via list-file batching: one CLI call for the whole batch.
+
+    SynthSeg's startup (TF init + GPU init + model load + cuDNN init) is
+    ~80s; inference itself is ~28s/scan on A100 GPU. Per-scan subprocess
+    invocation amortizes startup over zero scans (paying 80s × N), so we
+    instead write four list files (inputs / outputs / qc / vol, one path
+    per line) and pass them to SynthSeg's CLI in a single subprocess call.
+    The CLI iterates internally, sharing model + GPU state.
+
+    ``batch_size`` controls the maximum scans per CLI invocation; callers
+    typically pass a large value (or ``len(plans)``) so all plans process
+    in one call. We default-cap to 200 to bound peak memory inside the
+    SynthSeg process.
+    """
+    if not plans:
+        return []
+
+    import tempfile
+
+    cli_path = _locate_synthseg_cli()
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-    predict = _load_synthseg_predict()
+    cap = max(batch_size, 1)
+
+    # Pre-create output dirs so SynthSeg's writes don't fail.
+    for plan in plans:
+        plan.seg_path.parent.mkdir(parents=True, exist_ok=True)
+        plan.qc_path.parent.mkdir(parents=True, exist_ok=True)
+        plan.vol_path.parent.mkdir(parents=True, exist_ok=True)
+
+    chunks: list[list[ScanPlan]] = [plans[i : i + cap] for i in range(0, len(plans), cap)]
     results: list[tuple[ScanPlan, str]] = []
-    batches = _chunks(plans, batch_size)
-    iterator = (
-        tqdm(batches, desc="SynthSeg.predict", unit="batch")
-        if len(batches) > 1
-        else batches
+    chunk_iter = (
+        tqdm(chunks, desc="SynthSeg.predict", unit="batch")
+        if len(chunks) > 1
+        else chunks
     )
-    for batch in iterator:
-        try:
-            predict(
-                path_images=[str(p.input_path) for p in batch],
-                path_segmentations=[str(p.seg_path) for p in batch],
-                path_volumes=[str(p.vol_path) for p in batch],
-                path_qc_scores=[str(p.qc_path) for p in batch],
-                do_parcellation=True,
+
+    for chunk in chunk_iter:
+        with tempfile.TemporaryDirectory(prefix="synthseg_lists_") as tmp:
+            tmpdir = Path(tmp)
+            in_list = tmpdir / "inputs.txt"
+            out_list = tmpdir / "outputs.txt"
+            qc_list = tmpdir / "qc.txt"
+            vol_list = tmpdir / "vol.txt"
+
+            with in_list.open("w") as fi, out_list.open("w") as fo, \
+                 qc_list.open("w") as fq, vol_list.open("w") as fv:
+                for plan in chunk:
+                    fi.write(f"{plan.input_path}\n")
+                    fo.write(f"{plan.seg_path}\n")
+                    fq.write(f"{plan.qc_path}\n")
+                    fv.write(f"{plan.vol_path}\n")
+
+            cmd = [
+                sys.executable,
+                str(cli_path),
+                "--i", str(in_list),
+                "--o", str(out_list),
+                "--qc", str(qc_list),
+                "--vol", str(vol_list),
+            ]
+            if parc:
+                cmd.append("--parc")
+            if fast:
+                cmd.append("--fast")
+
+            logger.info(
+                "SynthSeg CLI batch: %d scan(s) starting with %s",
+                len(chunk),
+                chunk[0].input_path.name,
             )
-            results.extend((p, STATUS_OK) for p in batch)
-        except Exception as exc:
-            logger.warning(
-                "SynthSeg.predict failed on batch starting %s: %s",
-                batch[0].input_path.name,
-                exc,
-            )
-            results.extend((p, STATUS_FAILED) for p in batch)
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                # Verify each scan's seg_path now exists; mark missing ones failed.
+                for plan in chunk:
+                    if plan.seg_path.exists():
+                        results.append((plan, STATUS_OK))
+                    else:
+                        logger.warning(
+                            "SynthSeg succeeded but seg output missing for %s",
+                            plan.input_path.name,
+                        )
+                        results.append((plan, STATUS_FAILED))
+            except subprocess.CalledProcessError as exc:
+                stderr = (exc.stderr or "").strip().splitlines()[-10:]
+                logger.warning(
+                    "SynthSeg CLI batch failed (exit %d). Last stderr: %s",
+                    exc.returncode,
+                    " | ".join(stderr),
+                )
+                # On failure, mark scans that did get written as ok and the rest as failed.
+                for plan in chunk:
+                    results.append(
+                        (plan, STATUS_OK if plan.seg_path.exists() else STATUS_FAILED)
+                    )
+
     return results
 
 
@@ -519,7 +636,7 @@ def main(
             to_run, binary=fs_binary, env=fs_env, parc=parc, fast=fast
         )
     else:
-        run_results = run_python(to_run, batch_size=batch_size)
+        run_results = run_python(to_run, batch_size=batch_size, parc=parc, fast=fast)
 
     all_rows: list[tuple[ScanPlan, str]] = run_results + [
         (plan, STATUS_SKIPPED) for plan in to_skip

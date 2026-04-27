@@ -214,12 +214,17 @@ def test_freesurfer_home_flag_rejects_missing_binary(
 # ──────────────────────────────────────────────
 
 
-def test_python_mode_invokes_predict_with_batched_lists(
+def test_python_mode_invokes_synthseg_cli_with_list_files(
     synth_mod: types.ModuleType,
     runner: CliRunner,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Python mode shells out to SynthSeg's CLI with list files (one
+    path per line) for ``--i / --o / --qc / --vol``. This amortises
+    SynthSeg's ~80 s startup cost over the whole batch instead of paying
+    it per scan.
+    """
     input_dir = tmp_path / "in"
     output_dir = tmp_path / "out"
     manifest_path = tmp_path / "synthseg_manifest.csv"
@@ -230,12 +235,40 @@ def test_python_mode_invokes_predict_with_batched_lists(
         _touch_nii_gz(input_dir / "b" / "IXI003-HH-0003-T1.nii.gz"),
     ]
 
-    fake_predict = MagicMock(return_value=None)
-    fake_predict_module = types.ModuleType("SynthSeg.predict_synthseg")
-    fake_predict_module.predict = fake_predict
-    fake_synthseg_pkg = types.ModuleType("SynthSeg")
-    monkeypatch.setitem(sys.modules, "SynthSeg", fake_synthseg_pkg)
-    monkeypatch.setitem(sys.modules, "SynthSeg.predict_synthseg", fake_predict_module)
+    # Pretend SynthSeg's CLI lives somewhere — we don't actually need the
+    # file because subprocess.run is monkeypatched.
+    fake_cli = tmp_path / "fake_SynthSeg" / "scripts" / "commands" / "SynthSeg_predict.py"
+    fake_cli.parent.mkdir(parents=True, exist_ok=True)
+    fake_cli.write_text("# stub")
+    monkeypatch.setattr(synth_mod, "_locate_synthseg_cli", lambda: fake_cli)
+
+    captured_calls: list[dict[str, Any]] = []
+
+    def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        # Read the list-file contents NOW (before the temp dir is cleaned)
+        # and stash them alongside the argv for later assertions.
+        list_contents: dict[str, list[str]] = {}
+        for flag in ("--i", "--o", "--qc", "--vol"):
+            if flag in cmd:
+                list_path = Path(cmd[cmd.index(flag) + 1])
+                if list_path.exists():
+                    list_contents[flag] = [
+                        line.strip()
+                        for line in list_path.read_text().splitlines()
+                        if line.strip()
+                    ]
+        captured_calls.append({"cmd": list(cmd), "lists": list_contents})
+
+        # Touch each seg path so run_python's exists() check thinks the
+        # run succeeded.
+        for seg in list_contents.get("--o", []):
+            seg_path = Path(seg)
+            seg_path.parent.mkdir(parents=True, exist_ok=True)
+            seg_path.write_bytes(b"")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(synth_mod.subprocess, "run", fake_run)
 
     result = runner.invoke(
         synth_mod.app,
@@ -249,34 +282,34 @@ def test_python_mode_invokes_predict_with_batched_lists(
     )
     assert result.exit_code == 0, result.output
 
-    # 3 inputs, batch_size=2 → two chunks (2, 1).
-    assert fake_predict.call_count == 2
+    # 3 inputs, batch_size=2 → two CLI invocations (2, 1).
+    assert len(captured_calls) == 2
 
-    all_input_paths_called: list[str] = []
-    for call in fake_predict.call_args_list:
-        kwargs = call.kwargs
-        assert set(kwargs.keys()) >= {
-            "path_images",
-            "path_segmentations",
-            "path_volumes",
-            "path_qc_scores",
-            "do_parcellation",
-        }
-        assert kwargs["do_parcellation"] is True
-        # Paired lists must be same length and correspond position-wise.
-        n = len(kwargs["path_images"])
-        assert len(kwargs["path_segmentations"]) == n
-        assert len(kwargs["path_volumes"]) == n
-        assert len(kwargs["path_qc_scores"]) == n
-        all_input_paths_called.extend(kwargs["path_images"])
+    # Each call must reference the SynthSeg CLI script and pass list files
+    # to --i / --o / --qc / --vol; the lists must have matching lengths.
+    seen_inputs: list[str] = []
+    for entry in captured_calls:
+        cmd = entry["cmd"]
+        lists = entry["lists"]
+        assert any("SynthSeg_predict.py" in tok for tok in cmd)
+        assert set(lists.keys()) == {"--i", "--o", "--qc", "--vol"}
+        n = len(lists["--i"])
+        assert n in (1, 2), f"unexpected batch size {n}; expected 1 or 2"
+        assert len(lists["--o"]) == n
+        assert len(lists["--qc"]) == n
+        assert len(lists["--vol"]) == n
+        seen_inputs.extend(lists["--i"])
 
-    assert sorted(all_input_paths_called) == sorted(str(p) for p in inputs)
+    assert sorted(seen_inputs) == sorted(str(p.resolve()) for p in inputs)
 
     with manifest_path.open() as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 3
     assert all(row["status"] == synth_mod.STATUS_OK for row in rows)
     assert all(row["mode"] == "python" for row in rows)
+    # Manifest must reference all 3 input scans.
+    manifest_inputs = {row["input_path"] for row in rows}
+    assert manifest_inputs == {str(p.resolve()) for p in inputs}
 
 
 # ──────────────────────────────────────────────
