@@ -30,7 +30,7 @@ RESCALE_FASTMRI="${RESCALE_FASTMRI:-1}"
 log() { printf '[runpod_stage_data %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
 if [ ! -d "${SRC_DATA}" ]; then
-    log "ERROR: ${SRC_DATA} not found. Did runpod_setup.sh run first?"
+    log "ERROR: ${SRC_DATA} not found. Did gpu_server_setup.sh run first?"
     exit 1
 fi
 

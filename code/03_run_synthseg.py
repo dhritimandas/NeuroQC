@@ -27,7 +27,7 @@ Inputs:
     --mode             "freesurfer" (default) or "python".
     --freesurfer-home  FreeSurfer install root (e.g. /Applications/freesurfer/8.1.0);
                        defaults to $FREESURFER_HOME env var.
-    --batch-size       Per-call batch size in python mode (default 1).
+    --batch-size       Per-call batch size in python mode (default 50).
     --manifest-path    Aggregate CSV manifest (default results/tables/synthseg_manifest.csv).
     --dry-run          Log planned work; no subprocess or predict calls.
 
@@ -559,7 +559,15 @@ def main(
         ),
     ),
     batch_size: int = typer.Option(
-        1, "--batch-size", min=1, help="Batch size for --mode python."
+        50,
+        "--batch-size",
+        min=1,
+        help=(
+            "Batch size for --mode python (default 50). The first call in a "
+            "batch loads the TF graph + cuDNN kernels (~50-80 s); subsequent "
+            "calls in the same process amortise that cost. Pre-2026-04 the "
+            "default was 1, which paid the startup tax per scan."
+        ),
     ),
     parc: bool = typer.Option(
         True,

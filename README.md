@@ -118,7 +118,7 @@ tqdm, openai (and on Linux, bitsandbytes for 4-bit quantization).
 
 | Tool                  | Required for             | Install                                         |
 | --------------------- | ------------------------ | ----------------------------------------------- |
-| **FreeSurfer**        | Phase 03 SynthSeg        | macOS: 8.1.0+ via `bash scripts/install_freesurfer_macos.sh`. Linux: 8.2.0 via apt `.deb` (Ubuntu 22 — preferred) or 7.4.1 tarball via `bash scripts/install_freesurfer_linux.sh`. All paths require a free license at <https://surfer.nmr.mgh.harvard.edu/registration.html>. Note: FreeSurfer's bundled SynthSeg is CPU-only on modern hosts (FS team has deprecated GPU support); for GPU runs, use the standalone `BBillot/SynthSeg` clone — see `docs/runpod_setup.md`. |
+| **FreeSurfer**        | Phase 03 SynthSeg        | macOS: 8.1.0+ via `bash scripts/install_freesurfer_macos.sh`. Linux: 8.2.0 via apt `.deb` (Ubuntu 22 — preferred) or 7.4.1 tarball via `bash scripts/install_freesurfer_linux.sh`. All paths require a free license at <https://surfer.nmr.mgh.harvard.edu/registration.html>. Note: FreeSurfer's bundled SynthSeg is CPU-only on modern hosts (FS team has deprecated GPU support); for GPU runs, use the standalone `BBillot/SynthSeg` clone — `scripts/gpu_server_setup.sh` automates this. |
 | **AWS CLI**           | Phase 09b S3 acquisition | `brew install awscli` (macOS) / `pip install awscli` |
 | **DataLad** + git-annex | Canonical orchestration via `Makefile` and `scripts/run_*.sh` (per-phase `datalad save`, `datalad run` provenance). Optional if you invoke phase scripts directly. | `brew install datalad git-annex` (macOS) / `pip install datalad && conda install -c conda-forge git-annex` (Linux) |
 | **NVIDIA GPU + CUDA** | Phase 08a/08b/09 (VLM inference + fine-tuning) | Set `CUDA_VISIBLE_DEVICES`; bf16 + bitsandbytes 4-bit not bit-deterministic across hardware |
@@ -142,15 +142,20 @@ benefits from a GPU. We run cloud bootstraps on two platforms; setup
 guides for each are kept alongside this repo (gitignored — request from
 the maintainer for now):
 
-- `docs/runpod_setup.md` — A100 SXM 80 GB on RunPod, the production
-  target. `scripts/runpod_setup.sh` is a one-shot bootstrap that clones
-  the standalone `BBillot/SynthSeg` repo, applies portability patches
-  (NumPy-2 / Keras-3), installs cu118 PyTorch + tensorflow[and-cuda] +
-  tf-keras, sources FreeSurfer 8.2.0 (apt `.deb`), and writes an env
-  sentinel that re-establishes the full state on any new shell.
-  `scripts/runpod_stage_data.sh` then copies hot data to local NVMe
-  (avoiding RunPod's MooseFS-backed `/workspace`, which is ~10× slower
-  for SynthSeg's metadata-heavy I/O).
+- `docs/gpu_server_setup.md` — A100 / Hopper-class cloud GPU server
+  (RunPod, Jarvis, Lambda, Coreweave, vast.ai, ...). `scripts/gpu_server_setup.sh`
+  is a one-shot bootstrap that clones the standalone `BBillot/SynthSeg`
+  repo, applies portability patches (NumPy-2 / Keras-3 / predict.py),
+  cleans up cu13 wheels that conflict with the cu12 cuDNN TF expects,
+  installs cu118 PyTorch + tensorflow[and-cuda] + tf-keras, sources
+  FreeSurfer 8.2.0 (apt `.deb`), runs a Conv3D smoke that fails fast
+  on cuDNN issues, and writes an env sentinel that re-establishes the
+  full state on any new shell. `scripts/runpod_stage_data.sh` then copies
+  hot data to local NVMe (avoiding the quota'd network FS that backs
+  `/workspace` on most cloud GPU hosts, typically ~10× slower for
+  SynthSeg's metadata-heavy I/O). Launch the smoke under tmux via
+  `scripts/gpu_server_launch_smoke.sh` so SSH disconnects don't kill
+  multi-hour runs.
 - `docs/dandi_hub_setup.md` — DANDI Hub T4 GPU image, free for
   academic use. Different friction (idle culler + EFS), same end-state.
 
@@ -349,19 +354,25 @@ are in the per-phase script docstrings.
 | Symptom | Fix |
 | --- | --- |
 | Phase 01 reports `0 passed` for FastMRI | The H5→NIfTI extractor writes RSS magnitudes verbatim (max ≈ 10⁻³), which fails `MIN_MAX_INTENSITY=100`. Re-extract with `python code/00_extract_fastmri_t1.py --rescale-intensity --input-dir … --output-dir …` (default ON). For already-extracted NIfTIs, use the in-place rescale snippet in `scripts/runpod_stage_data.sh`. |
-| Phase 03 SynthSeg `--mode python` fails with `model path does not exist` | Standalone SynthSeg doesn't bundle weights. Symlink them from FreeSurfer: `ln -s $FREESURFER_HOME/models <SynthSeg-clone>/models`. `scripts/runpod_setup.sh:Phase 9` automates this. |
+| Phase 03 SynthSeg `--mode python` fails with `model path does not exist` | Standalone SynthSeg doesn't bundle weights. Symlink them from FreeSurfer at the **repo** level (not the package level): `ln -s $FREESURFER_HOME/models <SynthSeg-clone>/models` — i.e. `${SYNTHSEG_DIR}/models`, not `${SYNTHSEG_DIR}/SynthSeg/models`. `scripts/gpu_server_setup.sh:Phase 9` automates this. |
 | `RuntimeError: NVIDIA driver too old` (PyTorch) | The default `pip install torch` pulls cu121 wheels (need driver 530+). Reinstall with the cu118 index (works on driver 525+): `pip install torch torchvision --upgrade --index-url https://download.pytorch.org/whl/cu118`. |
 | Phase 03 wall-clock unexpectedly multi-hour | Confirm `--mode python` (not `--mode freesurfer`) — FreeSurfer's bundled SynthSeg is CPU-only on modern hosts. Also verify TF sees the GPU: `python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"`. |
-| RunPod SSH `Permission denied (publickey)` | Add your SSH pubkey via RunPod **Settings → SSH Keys** (account-level — injected into every new pod). Or use the Web Terminal once: `cat <pubkey> >> ~/.ssh/authorized_keys`. |
-| TensorFlow allocates all GPU memory at start | `export TF_FORCE_GPU_ALLOW_GROWTH=true` — included in `scripts/runpod_setup.sh`'s env sentinel. |
+| Phase 03 SynthSeg unexpectedly slow at ~80 s/scan despite GPU | `code/03_run_synthseg.py --batch-size` defaults to 50 since the bootstrap-hardening commit; older revisions defaulted to 1, paying the ~50-80 s TF + cuDNN + model-load tax per call. If you're on an older pin, pass `--batch-size 50` explicitly or update. |
+| Cloud GPU SSH `Permission denied (publickey)` | Add your SSH pubkey via your provider's account-level SSH-keys panel (the key is then injected into every new pod). Some providers also offer a Web Terminal for a one-time setup: `cat <pubkey> >> ~/.ssh/authorized_keys`. |
+| TensorFlow allocates all GPU memory at start | `export TF_FORCE_GPU_ALLOW_GROWTH=true` — included in `scripts/gpu_server_setup.sh`'s env sentinel. |
+| TF: `No DNN in stream executor` / `CUDNN_STATUS_INTERNAL_ERROR` on a cloud GPU host | `tensorflow[and-cuda]>=2.21` transitively pulls `nvidia-*-cu13` wheels whose cuDNN ABI conflicts with TF's cu12 expectation. `scripts/gpu_server_setup.sh:Phase 6` strips them and force-reinstalls `nvidia-cudnn-cu12`; if you hit this on an existing install, run: `pip uninstall -y nvidia-cudnn-cu13 nvidia-cusparselt-cu13 nvidia-nccl-cu13 nvidia-nvshmem-cu13` then `pip install --force-reinstall nvidia-cudnn-cu12`. |
+| SynthSeg `predict.py` raises `ValueError: setting an array element with a sequence` | NumPy 2.x removed the implicit length-1-array → scalar coercion that SynthSeg's `lr_indices[i, j] = np.where(...)[0]` relied on. Pin `numpy<2.0` (1.26.x is supported by TF 2.21). `scripts/gpu_server_setup.sh:Phase 6` handles this; for an existing install run `pip install 'numpy<2.0'`. |
+| SynthSeg crashes with `AttributeError: 'KerasTensor' object has no attribute 'node'` | A `import keras.X as Y` line slipped past a naïve `^import keras$` rewrite, mixing Keras 3 modules into code that expects tf-keras' Keras-2 `Model`. The hardened rewrite in `scripts/gpu_server_setup.sh:Phase 9` covers the dotted form; run that phase or apply manually with `sed -i 's\|^import keras\.\([a-zA-Z0-9_]*\)\|import tf_keras.\1\|' <SynthSeg-files>`. |
+| SSH disconnect kills running smoke despite `nohup` on a cloud GPU host | Many container hosts run a PID-1 cleanup that terminates child sessions when SSH drops. Launch under tmux: `tmux new-session -d -s smoke 'bash scripts/gpu_server_launch_smoke.sh'`; reconnect with `tmux attach -t smoke` (detach via Ctrl-B D). The helper also retries up to 5x on transient failure. |
+| `Disk quota exceeded` writing to `/workspace` on a cloud GPU host | `/workspace` is a quota'd network filesystem on many providers (e.g. MooseFS, EFS). Move venv + repos to local NVMe (commonly `/root`) — `scripts/gpu_server_setup.sh` does this on fresh installs; for an existing setup, `mv /workspace/NeuroQC /root/NeuroQC` then re-source `${WORK_DIR}/neuroqc_env.sh`. |
 | FreeSurfer setup script trips `set -euo pipefail` | `SetUpFreeSurfer.sh` uses unbound vars and runs internal tests with non-zero returns. Wrap with `set +eu; source $FREESURFER_HOME/SetUpFreeSurfer.sh; set -eu`. |
-| Pipeline I/O slow on cloud GPU instance | If working dir is a network filesystem (RunPod `/workspace`, DANDI Hub `/home/<user>`), stage hot data to a local-disk path. Per-scan SynthSeg I/O can be ~10× faster on local NVMe than network FS. |
+| Pipeline I/O slow on cloud GPU instance | If the working dir is a network filesystem (typical for managed `/workspace` mounts), stage hot data to a local-disk path. Per-scan SynthSeg I/O is ~10× faster on local NVMe. |
 | `pytest` fails with `command 'git-annex' not found` | DataLad-managed repos require `git-annex` to commit. Install via Homebrew (macOS): `brew install git-annex`. Linux: `conda install -c conda-forge git-annex` or `apt install git-annex`. |
 
 ## Citation
 
 If you use this codebase, please cite the corresponding NeuroQC paper
-(NeurIPS 2026 submission; bibtex pending camera-ready).
+(in submission; bibtex pending).
 
 ## License
 
