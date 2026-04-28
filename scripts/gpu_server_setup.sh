@@ -366,11 +366,20 @@ fi
 
 log "Symlinking SynthSeg model weights from ${FS_HOME}/models"
 SS_MODELS="${SYNTHSEG_DIR}/models"
-if [ -d "${FS_HOME}/models" ] && [ ! -L "${SS_MODELS}" ]; then
-    if [ -d "${SS_MODELS}" ] && [ ! "$(ls -A "${SS_MODELS}" 2>/dev/null)" ]; then
-        rmdir "${SS_MODELS}"
-    fi
-    if [ ! -e "${SS_MODELS}" ]; then
+# Force-replace any existing models dir with a symlink to ${FS_HOME}/models.
+# BBillot/SynthSeg's git clone ships only synthseg_1.0.h5 at ${SS_MODELS}/,
+# but --parc / --robust / --qc need the full set of .h5 + label .npy files
+# at ${FS_HOME}/models. The previous "skip if non-empty" guard left the
+# bundled-only state in place and broke --parc with `AssertionError: model
+# path does not exist.`. The bundled .h5 is also at ${FS_HOME}/models so
+# removal loses nothing.
+if [ -d "${FS_HOME}/models" ]; then
+    if [ -L "${SS_MODELS}" ]; then
+        log "${SS_MODELS} is already a symlink — leaving it"
+    else
+        if [ -e "${SS_MODELS}" ]; then
+            rm -rf "${SS_MODELS}"
+        fi
         ln -s "${FS_HOME}/models" "${SS_MODELS}"
         log "Symlinked ${SS_MODELS} -> ${FS_HOME}/models"
     fi
