@@ -188,6 +188,12 @@ fi
 # ── Phase 01 — curate references per dataset ───────────────────────────────
 section "Phase 01 — curate references"
 
+# Phase 01 honours CURATE_NUM_WORKERS (default 0 = cpu_count/2). NIfTI gz
+# decompression is CPU+IO bound; multiprocessing is the right knob (no GPU
+# path for gz). On a 128-CPU pod, 32 workers turn 1100-scan ABIDE curate
+# from ~30 min into ~1 min.
+CURATE_NUM_WORKERS="${CURATE_NUM_WORKERS:-0}"
+
 curate_ds() {
     local ds="$1" input_dir="$2" tag="$3"
     local marker="${PHASES_DIR}/.phase01_${ds}"
@@ -200,7 +206,7 @@ curate_ds() {
             --input-dir ${input_dir} \
             --output-dir data/${ds}/references \
             --manifest-path results/tables/reference_manifest_${ds}.csv \
-            --dataset-tag ${tag} --force"
+            --dataset-tag ${tag} --num-workers ${CURATE_NUM_WORKERS} --force"
     /usr/bin/touch "${marker}"
 }
 
