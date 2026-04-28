@@ -57,11 +57,25 @@ FS_FALLBACK_VERSION="${FS_FALLBACK_VERSION:-7.4.1}"  # tarball path
 FS_HOME_TAR="${WORK_DIR}/freesurfer/${FS_FALLBACK_VERSION}"
 FS_LICENSE_SRC="${FS_LICENSE_SRC:-${WORK_DIR}/freesurfer_license.txt}"
 
-# PyTorch wheel index — cu118 has the lowest driver floor (NVIDIA 525.x), so
-# it works across the widest range of RunPod hosts. Override with
-# TORCH_INDEX=https://download.pytorch.org/whl/cu121 if your host has driver
-# 530+.
-TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu118}"
+# PyTorch wheel index — auto-pick by driver if not user-overridden:
+#   driver < 530      → cu118  (lowest floor, oldest hosts)
+#   530 ≤ driver < 555 → cu121
+#   555 ≤ driver       → cu126  (driver 570 on Hopper-class hosts; cu118
+#                                  resolves cu130-PyPI fallback that doesn't
+#                                  see CUDA on this driver)
+# Override with TORCH_INDEX=… to pin a specific channel.
+if [ -z "${TORCH_INDEX:-}" ]; then
+    _DRIVER_MAJOR_PROBE=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | awk -F. '{print $1}')
+    if [ -z "${_DRIVER_MAJOR_PROBE}" ]; then
+        TORCH_INDEX="https://download.pytorch.org/whl/cu118"
+    elif [ "${_DRIVER_MAJOR_PROBE}" -ge 555 ]; then
+        TORCH_INDEX="https://download.pytorch.org/whl/cu126"
+    elif [ "${_DRIVER_MAJOR_PROBE}" -ge 530 ]; then
+        TORCH_INDEX="https://download.pytorch.org/whl/cu121"
+    else
+        TORCH_INDEX="https://download.pytorch.org/whl/cu118"
+    fi
+fi
 
 log() { printf '[gpu_server_setup %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 section() { printf '\n========================================\n%s\n========================================\n' "$*"; }
@@ -105,12 +119,22 @@ fi
 section "Phase 3 — Python 3.12 + venv (${VENV_DIR})"
 PY_BIN="$(command -v python3.12 || true)"
 if [ -z "${PY_BIN}" ]; then
-    log "python3.12 not found — installing via deadsnakes PPA"
+    # Ubuntu 22.04 jammy ships python3.12 in the default cache on most cloud
+    # GPU images (RunPod's pytorch:2.4.0 base inherits it). Try a direct apt
+    # install first; only fall back to deadsnakes PPA if that misses, since
+    # `add-apt-repository` may itself fail when the image's `apt_pkg` Python
+    # binding doesn't match the host interpreter (`ModuleNotFoundError:
+    # apt_pkg`). Direct install sidesteps that whole pathway.
     apt-get update -qq
-    apt-get install -y software-properties-common >/dev/null
-    add-apt-repository -y ppa:deadsnakes/ppa >/dev/null
-    apt-get update -qq
-    apt-get install -y python3.12 python3.12-venv python3.12-dev >/dev/null
+    if apt-get install -y python3.12 python3.12-venv python3.12-dev >/dev/null 2>&1; then
+        log "python3.12 installed from default apt cache"
+    else
+        log "default apt missed python3.12; installing via deadsnakes PPA"
+        apt-get install -y software-properties-common python3-apt >/dev/null
+        add-apt-repository -y ppa:deadsnakes/ppa >/dev/null
+        apt-get update -qq
+        apt-get install -y python3.12 python3.12-venv python3.12-dev >/dev/null
+    fi
     PY_BIN="$(command -v python3.12)"
 fi
 log "Using ${PY_BIN} ($(${PY_BIN} --version))"
@@ -132,6 +156,15 @@ pip install --upgrade pip --quiet
 # ── Phase 4: project + nobrainer + base deps ───────────────────────────────
 section "Phase 4 — project + nobrainer + base deps"
 cd "${NEUROQC_DIR}"
+# nobrainer's pyproject uses hatch-vcs / setuptools_scm to derive the version
+# from `git describe`. A shallow clone (Phase 2's `--depth=1`) makes that fail
+# with `TimeoutExpired` deep inside vcs_versioning, which surfaces as
+# `metadata-generation-failed`. Unshallow first so the version resolves.
+if [ -d "${NOBRAINER_DIR}/.git/shallow" ] || git -C "${NOBRAINER_DIR}" rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+    log "Unshallowing nobrainer git history (needed by setuptools_scm)"
+    git -C "${NOBRAINER_DIR}" fetch --unshallow 2>&1 | tail -3 || \
+        git -C "${NOBRAINER_DIR}" fetch --depth=10000 2>&1 | tail -3 || true
+fi
 log "Installing nobrainer (editable)"
 pip install -e "${NOBRAINER_DIR}" --quiet
 log "Installing NeuroQC + transitive deps from pyproject.toml"
@@ -160,11 +193,17 @@ pip install 'tensorflow[and-cuda]' tf-keras --quiet
 # "No DNN in stream executor" / CUDNN_STATUS_INTERNAL_ERROR. Strip them and
 # force-reinstall the cu12 cuDNN (the uninstall removes shared .so files
 # that other cu12 packages still need).
-log "Removing cu13 NVIDIA wheels and force-reinstalling cu12 cuDNN"
+log "Removing cu13 NVIDIA wheels and force-reinstalling cu12 counterparts"
 pip uninstall -y nvidia-cudnn-cu13 nvidia-cusparselt-cu13 nvidia-nccl-cu13 \
     nvidia-nvshmem-cu13 2>/dev/null || true
 rm -rf "${VENV_DIR}/lib/python"*"/site-packages/nvidia/cu13" 2>/dev/null || true
-pip install --force-reinstall nvidia-cudnn-cu12 --quiet
+# IMPORTANT: the cu13 uninstalls strip shared .so files that the cu12 wheels
+# co-own (they get the same site-packages/nvidia/<lib>/lib/ paths). Pip still
+# thinks the cu12 packages are installed but their actual binaries are gone,
+# producing later `ImportError: libcusparseLt.so.0 / libnvshmem_host.so.3 /
+# libnccl.so.2`. Force-reinstall ALL four cu12 packages to repopulate them.
+pip install --force-reinstall --no-deps nvidia-cudnn-cu12 nvidia-cusparselt-cu12 \
+    nvidia-nccl-cu12 nvidia-nvshmem-cu12 --quiet
 
 # SynthSeg's predict.py / get_flip_indices does `array_2d[i,j] = np.where(..)[0]`
 # which NumPy 2.x rejects ("setting an array element with a sequence" — the
@@ -209,12 +248,34 @@ assert gpus, 'TF cannot see GPU — check LD_LIBRARY_PATH and pod GPU exposure'
 # ── Phase 8: FreeSurfer (apt .deb preferred, tarball fallback) ─────────────
 section "Phase 8 — FreeSurfer ${FS_VERSION}"
 FS_HOME=""
-if [ -d "${FS_HOME_APT}" ] && [ -f "${FS_HOME_APT}/SetUpFreeSurfer.sh" ]; then
-    log "FreeSurfer 8.x already installed at ${FS_HOME_APT}"
-    FS_HOME="${FS_HOME_APT}"
-elif command -v apt-get >/dev/null 2>&1 && [ "${FS_VERSION%%.*}" -ge 8 ]; then
+# Probe known install locations first — many cloud GPU images ship FS already
+# under /workspace, /root, or /opt (saves the 9 GB redownload + extract).
+for _candidate in \
+    "${FS_HOME_APT}" \
+    "${WORK_DIR}/freesurfer/${FS_VERSION}" \
+    "/root/freesurfer/${FS_VERSION}" \
+    "/opt/freesurfer/${FS_VERSION}" \
+    "${WORK_DIR}/freesurfer/${FS_FALLBACK_VERSION}" \
+    "/root/freesurfer/${FS_FALLBACK_VERSION}" \
+    "/opt/freesurfer/${FS_FALLBACK_VERSION}"; do
+    if [ -d "${_candidate}" ] && [ -f "${_candidate}/SetUpFreeSurfer.sh" ]; then
+        log "FreeSurfer already installed at ${_candidate}"
+        FS_HOME="${_candidate}"
+        break
+    fi
+done
+if [ -z "${FS_HOME}" ] && command -v apt-get >/dev/null 2>&1 && [ "${FS_VERSION%%.*}" -ge 8 ]; then
     log "Installing FreeSurfer ${FS_VERSION} via apt (.deb)"
     apt-get update -qq
+    # apt-utils provides the non-interactive debconf frontend; without it,
+    # transitive postinst scripts (keyboard-configuration, tzdata) block on
+    # an interactive prompt that hangs the whole install.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q apt-utils >/dev/null 2>&1 || true
+    # Pre-seed the prompts that keyboard-configuration / tzdata postinst would
+    # ask for, so they take the default and proceed.
+    echo 'keyboard-configuration keyboard-configuration/layoutcode string us' | debconf-set-selections 2>/dev/null || true
+    echo 'tzdata tzdata/Areas select Etc' | debconf-set-selections 2>/dev/null || true
+    echo 'tzdata tzdata/Zones/Etc select UTC' | debconf-set-selections 2>/dev/null || true
     # surfer.nmr.mgh.harvard.edu hosts a .deb under
     # /pub/dist/freesurfer/<v>/freesurfer_ubuntu22-<v>_amd64.deb.
     DEB_URL="https://surfer.nmr.mgh.harvard.edu/pub/dist/freesurfer/${FS_VERSION}/freesurfer_ubuntu22-${FS_VERSION}_amd64.deb"
@@ -223,8 +284,8 @@ elif command -v apt-get >/dev/null 2>&1 && [ "${FS_VERSION%%.*}" -ge 8 ]; then
         log "Downloading ${DEB_URL}"
         curl -fL --output "${DEB_PATH}" "${DEB_URL}"
     fi
-    log "apt-get install -y ${DEB_PATH}"
-    apt-get install -y "${DEB_PATH}" >/dev/null \
+    log "DEBIAN_FRONTEND=noninteractive apt-get install -y ${DEB_PATH}"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${DEB_PATH}" >/dev/null 2>&1 \
         || log "apt install reported errors; will check ${FS_HOME_APT} below"
     if [ -f "${FS_HOME_APT}/SetUpFreeSurfer.sh" ]; then
         FS_HOME="${FS_HOME_APT}"
