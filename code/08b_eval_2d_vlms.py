@@ -402,7 +402,11 @@ class LlavaOVAdapter:
             images=slices, text=QC_PROMPT, return_tensors="pt"
         )
         inputs = {
-            k: (v.to(self.device, self.dtype) if torch.is_tensor(v) else v)
+            k: (
+                v.to(self.device, self.dtype)
+                if torch.is_tensor(v) and v.is_floating_point()
+                else (v.to(self.device) if torch.is_tensor(v) else v)
+            )
             for k, v in inputs.items()
         }
         with torch.no_grad():
@@ -457,7 +461,11 @@ class Qwen2VLAdapter:
             images=slices, text=QC_PROMPT, return_tensors="pt"
         )
         inputs = {
-            k: (v.to(self.device, self.dtype) if torch.is_tensor(v) else v)
+            k: (
+                v.to(self.device, self.dtype)
+                if torch.is_tensor(v) and v.is_floating_point()
+                else (v.to(self.device) if torch.is_tensor(v) else v)
+            )
             for k, v in inputs.items()
         }
         with torch.no_grad():
@@ -524,7 +532,11 @@ class MedGemmaAdapter:
             images=concat, text=QC_PROMPT, return_tensors="pt"
         )
         inputs = {
-            k: (v.to(self.device, self.dtype) if torch.is_tensor(v) else v)
+            k: (
+                v.to(self.device, self.dtype)
+                if torch.is_tensor(v) and v.is_floating_point()
+                else (v.to(self.device) if torch.is_tensor(v) else v)
+            )
             for k, v in inputs.items()
         }
         with torch.no_grad():
