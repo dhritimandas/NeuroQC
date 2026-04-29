@@ -250,7 +250,7 @@ def extract_and_cache_slices(
     for path, img in zip(cache_paths, pil_slices, strict=True):
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        img.save(tmp)
+        img.save(tmp, format="PNG")
         tmp.replace(path)
     return pil_slices
 
