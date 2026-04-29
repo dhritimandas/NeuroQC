@@ -398,8 +398,17 @@ class LlavaOVAdapter:
             raise RuntimeError("LlavaOVAdapter.load() must be called first")
         from nobrainer.qc.evaluate import QC_PROMPT
 
+        conversation = [{
+            "role": "user",
+            "content": [{"type": "image"} for _ in slices] + [
+                {"type": "text", "text": QC_PROMPT}
+            ],
+        }]
+        prompt = self.processor.apply_chat_template(
+            conversation, add_generation_prompt=True
+        )
         inputs = self.processor(
-            images=slices, text=QC_PROMPT, return_tensors="pt"
+            images=slices, text=prompt, return_tensors="pt"
         )
         inputs = {
             k: (
@@ -457,8 +466,17 @@ class Qwen2VLAdapter:
             raise RuntimeError("Qwen2VLAdapter.load() must be called first")
         from nobrainer.qc.evaluate import QC_PROMPT
 
+        conversation = [{
+            "role": "user",
+            "content": [{"type": "image"} for _ in slices] + [
+                {"type": "text", "text": QC_PROMPT}
+            ],
+        }]
+        prompt = self.processor.apply_chat_template(
+            conversation, add_generation_prompt=True
+        )
         inputs = self.processor(
-            images=slices, text=QC_PROMPT, return_tensors="pt"
+            images=slices, text=prompt, return_tensors="pt"
         )
         inputs = {
             k: (
@@ -528,8 +546,18 @@ class MedGemmaAdapter:
         from nobrainer.qc.evaluate import QC_PROMPT
 
         concat = _concat_horizontal(slices)
+        conversation = [{
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": QC_PROMPT},
+            ],
+        }]
+        prompt = self.processor.apply_chat_template(
+            conversation, add_generation_prompt=True
+        )
         inputs = self.processor(
-            images=concat, text=QC_PROMPT, return_tensors="pt"
+            images=concat, text=prompt, return_tensors="pt"
         )
         inputs = {
             k: (
