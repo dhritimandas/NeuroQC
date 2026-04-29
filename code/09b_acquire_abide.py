@@ -650,7 +650,7 @@ def _import_boto3():
 def make_anonymous_s3_client():
     """Anonymous (UNSIGNED) S3 client for public buckets like fcp-indi."""
     boto3_module, UNSIGNED, Config, _ = _import_boto3()
-    return boto3_module.client("s3", config=Config(signature_version=UNSIGNED))
+    return boto3_module.client("s3", config=Config(signature_version=UNSIGNED), region_name="us-east-1")
 
 
 def find_s3_raw_key(client, site: str, subject_id: int) -> str | None:
