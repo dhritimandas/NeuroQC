@@ -213,6 +213,19 @@ pip install --force-reinstall --no-deps nvidia-cudnn-cu12 nvidia-cusparselt-cu12
 log "Pinning numpy<2.0 (SynthSeg incompatible with NumPy 2.x scalar rules)"
 pip install 'numpy<2.0' --quiet
 
+# M3D-LaMed (Phase 08a / 09 / 10) pins:
+#   * monai<1.4 — `PatchEmbeddingBlock.__init__:pos_embed` was removed in
+#     monai 1.4 (the M3D-LaMed `modeling_m3d_lamed.py` uses the legacy
+#     pos_embed kwarg via trust_remote_code; loading otherwise fails with
+#     `unexpected keyword argument 'pos_embed'`).
+#   * transformers<4.50 — newer transformers break some trust_remote_code
+#     paths in M3D-LaMed (intermittent _PyImport_Init crash).
+#   * tiktoken + sentencepiece + protobuf — required by the M3D-LaMed
+#     tokenizer (`tiktoken is required to read a tiktoken file`).
+log "Pinning M3D-LaMed compatibility deps (monai<1.4, transformers<4.50, tiktoken, sentencepiece, protobuf)"
+pip install --quiet 'monai>=1.2,<1.4' 'transformers>=4.45,<4.50' \
+    tiktoken sentencepiece protobuf
+
 log "TF version + GPU check (in venv, before LD_LIBRARY_PATH patch)"
 python -c "
 import tensorflow as tf
