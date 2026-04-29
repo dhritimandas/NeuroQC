@@ -48,6 +48,7 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import multiprocessing as mp
 import os
 import re
 from dataclasses import dataclass
@@ -256,17 +257,26 @@ def build_header(label_names: dict[int, str]) -> list[str]:
 
 
 def load_existing(output_file: Path) -> set[str]:
-    """Return the set of ``scan_path`` values already recorded in ``output_file``.
+    """Return the set of ``seg_path`` values already recorded in ``output_file``.
 
-    Empty set if the file does not yet exist or is empty.
+    The resume check downstream compares ``str(seg_file)`` (a ``*_synthseg.nii.gz``
+    path) against this set, so the comparand has to be the seg path — using
+    ``scan_path`` here would never match and would silently re-process everything.
+
+    Empty set if the file does not yet exist or is empty. Falls back to
+    ``scan_path`` only on legacy CSVs (no ``seg_path`` column, pre-2026-04-25).
     """
     if not output_file.exists() or output_file.stat().st_size == 0:
         return set()
     with output_file.open("r", newline="") as handle:
         reader = csv.DictReader(handle)
-        if reader.fieldnames is None or SCAN_COLUMN not in reader.fieldnames:
+        if reader.fieldnames is None:
             return set()
-        return {row[SCAN_COLUMN] for row in reader if row.get(SCAN_COLUMN)}
+        if SEG_PATH_COLUMN in reader.fieldnames:
+            return {row[SEG_PATH_COLUMN] for row in reader if row.get(SEG_PATH_COLUMN)}
+        if SCAN_COLUMN in reader.fieldnames:
+            return {row[SCAN_COLUMN] for row in reader if row.get(SCAN_COLUMN)}
+        return set()
 
 
 def append_row(output_file: Path, row: ThicknessRow, header: list[str]) -> None:
@@ -291,6 +301,27 @@ def append_row(output_file: Path, row: ThicknessRow, header: list[str]) -> None:
             writer.writeheader()
         writer.writerow(record)
         handle.flush()
+
+
+# ──────────────────────────────────────────────
+# Multiprocessing worker (top-level for picklability)
+# ──────────────────────────────────────────────
+
+
+def _compute_thickness_worker(
+    args: tuple[Path, Path | None, dict[int, str]],
+) -> tuple[str, Path, ThicknessRow | str]:
+    """Pool worker: run ``compute_thickness`` and tag the result.
+
+    Returns ``("ok", seg_path, ThicknessRow)`` on success or
+    ``("err", seg_path, repr(exc))`` on failure. Errors are reported back to
+    the parent rather than swallowed so the parent can keep a single log.
+    """
+    seg_path, scan_path, label_names = args
+    try:
+        return ("ok", seg_path, compute_thickness(seg_path, label_names, scan_path=scan_path))
+    except Exception as exc:
+        return ("err", seg_path, repr(exc))
 
 
 # ──────────────────────────────────────────────
@@ -416,6 +447,16 @@ def main(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Log the first 10 pending scans and return."
     ),
+    num_workers: int = typer.Option(
+        8,
+        "--num-workers",
+        help=(
+            "Process pool size for per-seg thickness compute. Each scan is "
+            "independent (load NIfTI + EDT + per-region mean) — embarrassingly "
+            "parallel. 1 = serial loop (legacy). Default 8 fits comfortably on "
+            "the 128-CPU pod and gives ~8x speedup for N>>workers."
+        ),
+    ),
 ) -> None:
     """Aggregate per-region cortical thickness across all SynthSeg outputs."""
     logging.basicConfig(
@@ -467,8 +508,8 @@ def main(
 
     processed = 0
     n_unmatched = 0
-    iterator = tqdm(pending, desc="thickness", unit="scan") if len(pending) > 1 else pending
-    for seg_path in iterator:
+    work_items: list[tuple[Path, Path | None, dict[int, str]]] = []
+    for seg_path in pending:
         scan_path = seg_to_scan.get(str(seg_path.resolve()))
         if synthseg_manifest and scan_path is None:
             n_unmatched += 1
@@ -476,13 +517,32 @@ def main(
                 "Seg %s not in any synthseg manifest; falling back to seg path "
                 "as scan_path for this row.", seg_path.name,
             )
-        try:
-            row = compute_thickness(seg_path, label_names, scan_path=scan_path)
-        except Exception as exc:
-            logger.warning("thickness failed for %s: %s", seg_path.name, exc)
-            continue
-        append_row(output_file, row, header)
-        processed += 1
+        work_items.append((seg_path, scan_path, label_names))
+
+    use_pool = num_workers > 1 and len(work_items) > 1
+    if use_pool:
+        logger.info("Spawning %d workers for %d pending segs", num_workers, len(work_items))
+        with mp.get_context("spawn").Pool(processes=num_workers) as pool:
+            iterator = tqdm(
+                pool.imap_unordered(_compute_thickness_worker, work_items, chunksize=1),
+                total=len(work_items), desc="thickness", unit="scan",
+            )
+            for status, seg_path, payload in iterator:
+                if status == "err":
+                    logger.warning("thickness failed for %s: %s", seg_path.name, payload)
+                    continue
+                append_row(output_file, payload, header)
+                processed += 1
+    else:
+        iterator = tqdm(work_items, desc="thickness", unit="scan") if len(work_items) > 1 else work_items
+        for seg_path, scan_path, _ in iterator:
+            try:
+                row = compute_thickness(seg_path, label_names, scan_path=scan_path)
+            except Exception as exc:
+                logger.warning("thickness failed for %s: %s", seg_path.name, exc)
+                continue
+            append_row(output_file, row, header)
+            processed += 1
     if n_unmatched:
         logger.warning(
             "%d seg file(s) had no manifest match; their scan_path columns "
