@@ -134,7 +134,7 @@ MULTI_IMAGE: str = "multi_image"
 CONCAT_GRID: str = "concat_grid"
 
 # Model registry tags.
-_MODEL_CHOICES: tuple[str, ...] = ("llava_ov", "qwen2_vl", "medgemma", "gpt4o")
+_MODEL_CHOICES: tuple[str, ...] = ("llava_ov", "qwen2_vl", "medgemma", "gpt4o", "llava_med", "huatuo_vision")
 DEFAULT_MODELS: tuple[str, ...] = _MODEL_CHOICES
 
 # GPT-4o defaults. `--gpt-model` is CLI so users can track OpenAI's naming
@@ -250,7 +250,7 @@ def extract_and_cache_slices(
     for path, img in zip(cache_paths, pil_slices, strict=True):
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        img.save(tmp)
+        img.save(tmp, format="PNG")
         tmp.replace(path)
     return pil_slices
 
@@ -402,7 +402,11 @@ class LlavaOVAdapter:
             images=slices, text=QC_PROMPT, return_tensors="pt"
         )
         inputs = {
-            k: (v.to(self.device, self.dtype) if torch.is_tensor(v) else v)
+            k: (
+                v.to(self.device, self.dtype)
+                if torch.is_tensor(v) and v.is_floating_point()
+                else (v.to(self.device) if torch.is_tensor(v) else v)
+            )
             for k, v in inputs.items()
         }
         with torch.no_grad():
@@ -457,7 +461,11 @@ class Qwen2VLAdapter:
             images=slices, text=QC_PROMPT, return_tensors="pt"
         )
         inputs = {
-            k: (v.to(self.device, self.dtype) if torch.is_tensor(v) else v)
+            k: (
+                v.to(self.device, self.dtype)
+                if torch.is_tensor(v) and v.is_floating_point()
+                else (v.to(self.device) if torch.is_tensor(v) else v)
+            )
             for k, v in inputs.items()
         }
         with torch.no_grad():
@@ -498,18 +506,15 @@ class MedGemmaAdapter:
     dtype: torch.dtype | None = None
 
     def load(self, device: torch.device, dtype: torch.dtype) -> None:
-        from transformers import AutoModelForCausalLM, AutoProcessor
+        from transformers import AutoModelForImageTextToText, AutoProcessor
 
         self.device, self.dtype = device, dtype
-        self.processor = AutoProcessor.from_pretrained(
-            self.model_id, trust_remote_code=True
-        )
+        self.processor = AutoProcessor.from_pretrained(self.model_id)
         self.model = _try_load_hf_vlm(
             self.model_id,
-            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
             device=device,
             dtype=dtype,
-            trust_remote_code=True,
         )
 
     def run_inference(
@@ -520,11 +525,20 @@ class MedGemmaAdapter:
         from nobrainer.qc.evaluate import QC_PROMPT
 
         concat = _concat_horizontal(slices)
-        inputs = self.processor(
-            images=concat, text=QC_PROMPT, return_tensors="pt"
+        # Gemma-3 multimodal requires chat template with explicit image token
+        conversation = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": QC_PROMPT}
+        ]}]
+        prompt = self.processor.apply_chat_template(
+            conversation, add_generation_prompt=True
         )
+        inputs = self.processor(images=concat, text=prompt, return_tensors="pt")
         inputs = {
-            k: (v.to(self.device, self.dtype) if torch.is_tensor(v) else v)
+            k: (
+                v.to(self.device, self.dtype)
+                if torch.is_tensor(v) and v.is_floating_point()
+                else (v.to(self.device) if torch.is_tensor(v) else v)
+            )
             for k, v in inputs.items()
         }
         with torch.no_grad():
@@ -676,11 +690,132 @@ class GPT4oAdapter:
         self.client = None
 
 
+@dataclass
+class LlavaMedAdapter:
+    """LLaVA-Med-v1.5-Mistral-7B (community HF conversion). Single-image concat-grid."""
+
+    model_id: str = "chaoyinshe/llava-med-v1.5-mistral-7b-hf"
+    name: str = "llava_med"
+    multi_image_mode: str = CONCAT_GRID
+    model: Any = None
+    processor: Any = None
+    device: torch.device | None = None
+    dtype: torch.dtype | None = None
+
+    def load(self, device: torch.device, dtype: torch.dtype) -> None:
+        from transformers import AutoProcessor, LlavaForConditionalGeneration
+
+        self.device, self.dtype = device, dtype
+        self.processor = AutoProcessor.from_pretrained(self.model_id)
+        self.model = _try_load_hf_vlm(
+            self.model_id,
+            LlavaForConditionalGeneration,
+            device=device,
+            dtype=dtype,
+        )
+
+    def run_inference(
+        self, slices: list[Image.Image], max_new_tokens: int = _MAX_NEW_TOKENS_DEFAULT
+    ) -> str:
+        if self.model is None or self.processor is None:
+            raise RuntimeError("LlavaMedAdapter.load() must be called first")
+        from nobrainer.qc.evaluate import QC_PROMPT
+
+        concat = _concat_horizontal(slices)
+        # Standard LLaVA format requires <image> placeholder in the prompt text
+        prompt = f"<image>\n{QC_PROMPT}"
+        inputs = self.processor(images=concat, text=prompt, return_tensors="pt")
+        inputs = {
+            k: (
+                v.to(self.device, self.dtype)
+                if torch.is_tensor(v) and v.is_floating_point()
+                else (v.to(self.device) if torch.is_tensor(v) else v)
+            )
+            for k, v in inputs.items()
+        }
+        with torch.no_grad():
+            out = self.model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False
+            )
+        return self.processor.decode(out[0], skip_special_tokens=True)
+
+    def parse_score(self, raw: str) -> float:
+        return _normalize_qc_score(raw)
+
+    def unload(self) -> None:
+        self.model = None
+        self.processor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+
+@dataclass
+class HuatuoVisionAdapter:
+    """HuatuoGPT-Vision-7B (HF LLaVA-format version). Single-image concat-grid."""
+
+    model_id: str = "FreedomIntelligence/HuatuoGPT-Vision-7B-hf"
+    name: str = "huatuo_vision"
+    multi_image_mode: str = CONCAT_GRID
+    model: Any = None
+    processor: Any = None
+    device: torch.device | None = None
+    dtype: torch.dtype | None = None
+
+    def load(self, device: torch.device, dtype: torch.dtype) -> None:
+        from transformers import AutoProcessor, LlavaForConditionalGeneration
+
+        self.device, self.dtype = device, dtype
+        self.processor = AutoProcessor.from_pretrained(self.model_id)
+        self.model = _try_load_hf_vlm(
+            self.model_id,
+            LlavaForConditionalGeneration,
+            device=device,
+            dtype=dtype,
+        )
+
+    def run_inference(
+        self, slices: list[Image.Image], max_new_tokens: int = _MAX_NEW_TOKENS_DEFAULT
+    ) -> str:
+        if self.model is None or self.processor is None:
+            raise RuntimeError("HuatuoVisionAdapter.load() must be called first")
+        from nobrainer.qc.evaluate import QC_PROMPT
+
+        concat = _concat_horizontal(slices)
+        prompt = f"<image>\n{QC_PROMPT}"
+        inputs = self.processor(images=concat, text=prompt, return_tensors="pt")
+        inputs = {
+            k: (
+                v.to(self.device, self.dtype)
+                if torch.is_tensor(v) and v.is_floating_point()
+                else (v.to(self.device) if torch.is_tensor(v) else v)
+            )
+            for k, v in inputs.items()
+        }
+        with torch.no_grad():
+            out = self.model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False
+            )
+        return self.processor.decode(out[0], skip_special_tokens=True)
+
+    def parse_score(self, raw: str) -> float:
+        return _normalize_qc_score(raw)
+
+    def unload(self) -> None:
+        self.model = None
+        self.processor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+
 _ADAPTERS: dict[str, Callable[[], VLM2DAdapter]] = {
     "llava_ov": LlavaOVAdapter,
     "qwen2_vl": Qwen2VLAdapter,
     "medgemma": MedGemmaAdapter,
     "gpt4o": GPT4oAdapter,
+    "llava_med": LlavaMedAdapter,
+    "huatuo_vision": HuatuoVisionAdapter,
 }
 
 
